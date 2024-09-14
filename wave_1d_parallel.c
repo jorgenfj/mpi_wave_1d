@@ -5,13 +5,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <sys/time.h>
-
-// TASK: T1a
-// Include the MPI headerfile
-// BEGIN: T1a
-;
-// END: T1a
-
+#include <mpi.h>
 
 // Option to change numerical precision.
 typedef int64_t int_t;
@@ -19,9 +13,11 @@ typedef double real_t;
 
 
 // TASK: T1b
-// Declare variables each MPI process will need
-// BEGIN: T1b
-;
+int rank, size; 
+
+// Arrays to hold the counts and displacements for each process
+int *rank_partition_size = NULL;
+int *rank_offset = NULL;
 // END: T1b
 
 
@@ -57,6 +53,10 @@ real_t
 void domain_save ( int_t step )
 {
 // BEGIN: T8
+    if ( rank != 0 )
+    {
+        return;
+    }
     char filename[256];
     sprintf ( filename, "data/%.5ld.dat", step );
     FILE *out = fopen ( filename, "wb" );
@@ -73,13 +73,42 @@ void domain_save ( int_t step )
 void domain_initialize ( void )
 {
 // BEGIN: T3
-    buffers[0] = malloc ( (N+2)*sizeof(real_t) );
-    buffers[1] = malloc ( (N+2)*sizeof(real_t) );
-    buffers[2] = malloc ( (N+2)*sizeof(real_t) );
+    
+    // Allocate memory for the arrays containing the counts and displacements for each process
+    rank_partition_size = malloc(size * sizeof(int));
+    rank_offset = malloc(size * sizeof(int));
 
-    for ( int_t i=0; i<N; i++ )
+    // Calculate partition sizes and displacements for each process
+    int base_partition_size = N / size;
+    int remainder = N % size;
+
+    // Adjust partition size for each process based on its rank
+    int offset = 0;
+    for (int i = 0; i < size; i++) {
+        int current_partition_size = (i < remainder) ? base_partition_size + 1 : base_partition_size;
+
+        // Each rank fills the arrays with partition sizes and displacements
+        rank_partition_size[i] = current_partition_size;
+        rank_offset[i] = offset;
+
+        // Offset is updated for the next process
+        offset += current_partition_size;
+    }
+
+    if (rank == 0) {
+        // Allocate space for the entire domain on rank 0
+        buffers[0] = malloc((N + 2) * sizeof(real_t));  // +2 for ghost points
+        buffers[1] = malloc((N + 2) * sizeof(real_t));
+        buffers[2] = malloc((N + 2) * sizeof(real_t));
+    } else {
+        // Allocate space for only the partition on other ranks
+        buffers[0] = malloc((rank_partition_size[rank] + 2) * sizeof(real_t));  // +2 for ghost points
+        buffers[1] = malloc((rank_partition_size[rank] + 2) * sizeof(real_t));
+        buffers[2] = malloc((rank_partition_size[rank] + 2) * sizeof(real_t));
+    }
+    for ( int_t i = 0; i < rank_partition_size[rank]; i++ )
     {
-        U_prv(i) = U(i) = cos ( M_PI*i / (real_t)N );
+        U_prv(i) = U(i) = cos ( (M_PI*(i+rank_offset[rank])) / (real_t)N );
     }
 // END: T3
 
@@ -112,7 +141,7 @@ void move_buffer_window ( void )
 void time_step ( void )
 {
 // BEGIN: T4
-    for ( int_t i=0; i<N; i++ )
+    for ( int_t i=0; i<rank_partition_size[rank]; i++ )
     {
         U_nxt(i) = -U_prv(i) + 2.0*U(i)
                  + (dt*dt*c*c)/(dx*dx) * (U(i-1)+U(i+1)-2.0*U(i));
@@ -126,8 +155,15 @@ void time_step ( void )
 void boundary_condition ( void )
 {
 // BEGIN: T6
-    U(-1) = U(1);
-    U(N) = U(N-2);
+
+    if ( rank == 0 )
+    {
+        U(-1) = U(1);
+    }
+    if ( rank == size - 1 )
+    {
+        U(rank_partition_size[rank]) = U(rank_partition_size[rank]-2);
+    }
 // END: T6
 }
 
@@ -137,7 +173,16 @@ void boundary_condition ( void )
 void border_exchange( void )
 {
 // BEGIN: T5
-    ;
+    if ( rank > 0 )
+    {
+        MPI_Send ( &U(0), 1, MPI_DOUBLE, rank-1, 0, MPI_COMM_WORLD );
+        MPI_Recv ( &U(-1), 1, MPI_DOUBLE, rank-1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
+    }
+    if ( rank < size - 1)
+    {
+        MPI_Send ( &U(rank_partition_size[rank]-1), 1, MPI_DOUBLE, rank+1, 0, MPI_COMM_WORLD );
+        MPI_Recv ( &U(rank_partition_size[rank]), 1, MPI_DOUBLE, rank+1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
+    }
 // END: T5
 }
 
@@ -147,10 +192,18 @@ void border_exchange( void )
 // to root and assemble it in the root buffer
 void send_data_to_root()
 {
-// BEGIN: T7
-    ;
-// END: T7
+    
+    if (rank == 0) {
+        MPI_Gatherv(MPI_IN_PLACE, rank_partition_size[rank], MPI_DOUBLE,
+                    &U(0), rank_partition_size, rank_offset, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    } else {
+        // Other ranks send their data to rank 0
+        MPI_Gatherv(&U(0), rank_partition_size[rank], MPI_DOUBLE,
+                    NULL, NULL, NULL, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    }
+
 }
+
 
 
 // Main time integration.
@@ -179,8 +232,11 @@ int main ( int argc, char **argv )
 {
 // TASK: T1c
 // Initialise MPI
+
 // BEGIN: T1c
-    ;
+    MPI_Init ( &argc, &argv );
+    MPI_Comm_rank ( MPI_COMM_WORLD, &rank );
+    MPI_Comm_size ( MPI_COMM_WORLD, &size );
 // END: T1c
     
     struct timeval t_start, t_end;
@@ -190,7 +246,16 @@ int main ( int argc, char **argv )
 // TASK: T2
 // Time your code
 // BEGIN: T2
+    if ( rank == 0 )
+    {
+        gettimeofday ( &t_start, NULL );
+    }
     simulate();
+    if ( rank == 0 )
+    {
+        gettimeofday ( &t_end, NULL );
+        printf ( "Elapsed time: %.6f seconds\n", WALLTIME(t_end)-WALLTIME(t_start) );
+    }
 // END: T2
    
     domain_finalize();
@@ -198,7 +263,7 @@ int main ( int argc, char **argv )
 // TASK: T1d
 // Finalise MPI
 // BEGIN: T1d
-    ;
+    MPI_Finalize();
 // END: T1d
 
     exit ( EXIT_SUCCESS );
